@@ -1,0 +1,16 @@
+[package]
+name = "cilogger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cilogger"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+color-eyre = "0.6"
+common = { path = "../core" }
+humantime = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

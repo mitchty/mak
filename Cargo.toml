@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/cilogger", "crates/mak"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "BlueOak-1.0.0"
+
+[workspace.metadata.crane]
+name = "mak"

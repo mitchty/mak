@@ -1,0 +1,7 @@
+* Mitchty Army Knife
+
+This is unlikely to be useful to anyone else, but who knows. Note as its not really intended for "release" its "just" a nix flake as thats how I use it.
+
+For now the only "useful" thing is ~cilogger~ which is used mostly for forgejo workflow steps to reduce the noise for jobs that I want to "run until it fails" stress test type workflows. Aka cargo nextest in a loop until it fails or if we hit the job timeout then its "fine" which seems odd but for a "run it until it breaks" setup it makes some sense.
+
+The actual ~mak~ binary for now is a stub from the mitchty/flakelight-rust multi-binary examples, which I shamelessly copied cause I am a hack and thats kinda why I crated the dam thing...
