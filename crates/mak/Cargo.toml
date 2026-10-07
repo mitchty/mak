@@ -10,3 +10,15 @@ path = "src/main.rs"
 
 [dependencies]
 common = { path = "../core" }
+bytesize = "~1"
+clap = { version = "~4", features = ["derive", "env"] }
+color-eyre = "~0.6"
+futures-util = "~0.3"
+reqwest = { version = "~0.13", features = [
+  "form",
+  "json",
+  "rustls",
+], default-features = false }
+serde_json = "~1"
+tabled = "~0.22"
+tokio = { version = "~1", features = ["macros", "rt-multi-thread"] }
