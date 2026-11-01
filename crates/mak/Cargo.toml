@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 common = { path = "../core" }
-bytesize = "~1"
+bytesize = "~2.7"
 clap = { version = "~4", features = ["derive", "env"] }
 color-eyre = "~0.6"
 futures-util = "~0.3"
