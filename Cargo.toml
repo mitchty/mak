@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/cilogger", "crates/mak"]
+members = ["crates/core", "crates/cilogger", "crates/ecahook", "crates/mak"]
 
 [workspace.package]
 version = "0.1.0"

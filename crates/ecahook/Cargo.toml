@@ -1,0 +1,20 @@
+[package]
+name = "ecahook"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ecahook"
+path = "src/main.rs"
+
+[dependencies]
+humantime = "~2"
+serde = { version = "~1", features = ["derive"] }
+serde_json = "~1"
+thiserror = "~2"
+which = "~8"
+xdg = "~3"
+
+[dev-dependencies]
+tempfile = "~3"

@@ -45,6 +45,11 @@
               };
             };
 
+            ecahook = {
+              crate = ./crates/ecahook;
+              pathDeps = [ ];
+            };
+
             mak = {
               crate = ./crates/mak;
               pathDeps = [ ./crates/core ];
