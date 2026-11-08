@@ -14,7 +14,7 @@ use nix::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, BufReader},
     process::{Child, Command},
-    signal::unix::{SignalKind, signal as unix_signal},
+    signal::unix::{Signal as UnixSignal, SignalKind, signal as unix_signal},
     sync::Mutex,
     time::Instant,
 };
@@ -37,6 +37,9 @@ pub struct WrapConfig {
     pub timestamps: bool,
     /// Repeat the command until it fails or we timeout or not.
     pub repeat: bool,
+    /// Shell command that must succeed before `command` is looped. Iff it fails
+    /// its failure is printed instead of running the main command loop.
+    pub prime: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +87,9 @@ pub enum WrapError {
     /// Mitch forgot to pass a command like a dum dum
     #[error("no command for exec()")]
     EmptyCommand,
+    /// Mitch also forgot to pass in something to --prime too or did "$foo" without $foo set
+    #[error("no prime command for exec()")]
+    EmptyPrime,
     /// Couldn't exec() whatever it was.
     #[error("failed to exec command: {0}")]
     Spawn(#[source] std::io::Error),
@@ -146,63 +152,64 @@ pub async fn run(config: WrapConfig) -> Result<Outcome, WrapError> {
         return Err(WrapError::EmptyCommand);
     };
 
+    // The prime command is passed through sh -c so callers can do 'foo | bar' ezpzlemonsqeezy in scripts.
+    let prime_args = match config.prime.as_deref().map(str::trim) {
+        Some("") => return Err(WrapError::EmptyPrime),
+        Some(prime) => Some(["-c".to_string(), prime.to_string()]),
+        None => None,
+    };
+
     let state = Arc::new(Mutex::new(SharedState::new(
         config.log_file.as_deref(),
         config.timestamps,
     )?));
     let flush_task = tokio::spawn(periodic_flush(Arc::clone(&state)));
 
-    // Probs better ways than this but whatever this is garbage code anyway
-    // doesn't need to be perfect just replacing a ton of annoying shell tools.
-    let mut sighup = unix_signal(SignalKind::hangup()).map_err(WrapError::SignalSetup)?;
-    let mut sigint = unix_signal(SignalKind::interrupt()).map_err(WrapError::SignalSetup)?;
-    let mut sigquit = unix_signal(SignalKind::quit()).map_err(WrapError::SignalSetup)?;
-    let mut sigterm = unix_signal(SignalKind::terminate()).map_err(WrapError::SignalSetup)?;
-    let mut sigusr1 = unix_signal(SignalKind::user_defined1()).map_err(WrapError::SignalSetup)?;
-    let mut sigusr2 = unix_signal(SignalKind::user_defined2()).map_err(WrapError::SignalSetup)?;
+    let mut signals = Signals::install()?;
     let deadline = config.timeout.map(|d| Instant::now() + d);
 
+    // The prime command must succeed before the command loop is ran.
+    let primed = match prime_args {
+        Some(args) => {
+            let (outcome, _) = run_child("sh", &args, &state, &mut signals, deadline).await?;
+            match outcome {
+                Outcome::Exited(0) => None,
+                Outcome::Exited(code) => {
+                    eprintln!("cilogger: prime command failed, exit code {code}");
+                    Some(outcome)
+                }
+                Outcome::TimedOut => {
+                    eprintln!("cilogger: timeout elapsed during prime command");
+                    Some(outcome)
+                }
+                Outcome::Signaled(sig) => {
+                    eprintln!("cilogger: received {sig} during prime command");
+                    Some(outcome)
+                }
+            }
+        }
+        None => None,
+    };
+
     let mut stats = RunStats::default();
-    let outcome = loop {
-        let mut child = spawn(program, args)?;
-        let pid = child.id().map(|id| id as i32);
-        let stdout = child.stdout.take().expect("stdout was piped at spawn");
-        let stderr = child.stderr.take().expect("stderr was piped at spawn");
-
-        let stdout_task = tokio::spawn(pump_lines(stdout, Arc::clone(&state)));
-        let stderr_task = tokio::spawn(pump_lines(stderr, Arc::clone(&state)));
-
-        let started = Instant::now();
-        let outcome = tokio::select! {
-            status = child.wait() => Outcome::Exited(exit_code(status.map_err(WrapError::Wait)?)),
-            _ = sighup.recv() => Outcome::Signaled(WrapSignal::Hup),
-            _ = sigint.recv() => Outcome::Signaled(WrapSignal::Int),
-            _ = sigquit.recv() => Outcome::Signaled(WrapSignal::Quit),
-            _ = sigterm.recv() => Outcome::Signaled(WrapSignal::Term),
-            _ = sigusr1.recv() => Outcome::Signaled(WrapSignal::Usr1),
-            _ = sigusr2.recv() => Outcome::Signaled(WrapSignal::Usr2),
-            () = deadline_or_pending(deadline) => Outcome::TimedOut,
-        };
-        if let Outcome::Exited(_) = outcome {
-            stats.record(started.elapsed());
-        }
-
-        let stop_pid = pid.filter(|_| !matches!(outcome, Outcome::Exited(_)));
-        if let Some(pid) = stop_pid {
-            stop_process_group(pid, &mut child).await;
-        }
-
-        let _ = stdout_task.await;
-        let _ = stderr_task.await;
-
-        if config.repeat && outcome == Outcome::Exited(0) {
-            continue;
-        }
-        break outcome;
+    let outcome = match primed {
+        Some(outcome) => outcome,
+        None => loop {
+            let (outcome, elapsed) =
+                run_child(program, args, &state, &mut signals, deadline).await?;
+            if let Outcome::Exited(_) = outcome {
+                stats.record(elapsed);
+            }
+            if config.repeat && outcome == Outcome::Exited(0) {
+                continue;
+            }
+            break outcome;
+        },
     };
 
     // Dump out the exec() stats just not to the log file.
     match outcome {
+        _ if primed.is_some() => {}
         Outcome::Signaled(sig) if config.repeat => {
             eprintln!("cilogger: received {sig} after {stats}, stopping wrapped command");
         }
@@ -221,6 +228,80 @@ pub async fn run(config: WrapConfig) -> Result<Outcome, WrapError> {
     state.lock().await.finish()?;
 
     Ok(outcome)
+}
+
+/// Signals cilogger wraps instead of letting the underlying os handle. This is
+/// mostly so that the child group can be stopped cleanly and we exit 0 in the
+/// event of things like a timeout.
+struct Signals {
+    hup: UnixSignal,
+    int: UnixSignal,
+    quit: UnixSignal,
+    term: UnixSignal,
+    usr1: UnixSignal,
+    usr2: UnixSignal,
+}
+
+impl Signals {
+    fn install() -> Result<Self, WrapError> {
+        let install = |kind| unix_signal(kind).map_err(WrapError::SignalSetup);
+        Ok(Self {
+            hup: install(SignalKind::hangup())?,
+            int: install(SignalKind::interrupt())?,
+            quit: install(SignalKind::quit())?,
+            term: install(SignalKind::terminate())?,
+            usr1: install(SignalKind::user_defined1())?,
+            usr2: install(SignalKind::user_defined2())?,
+        })
+    }
+
+    async fn recv(&mut self) -> WrapSignal {
+        tokio::select! {
+            _ = self.hup.recv() => WrapSignal::Hup,
+            _ = self.int.recv() => WrapSignal::Int,
+            _ = self.quit.recv() => WrapSignal::Quit,
+            _ = self.term.recv() => WrapSignal::Term,
+            _ = self.usr1.recv() => WrapSignal::Usr1,
+            _ = self.usr2.recv() => WrapSignal::Usr2,
+        }
+    }
+}
+
+/// Run one child process to completion, a signal or deadline, stopping the
+/// process group if the child hasn't exited yet. Returns the outcome and how
+/// long it ran for logging purposes.
+async fn run_child(
+    program: &str,
+    args: &[String],
+    state: &Arc<Mutex<SharedState>>,
+    signals: &mut Signals,
+    deadline: Option<Instant>,
+) -> Result<(Outcome, Duration), WrapError> {
+    let mut child = spawn(program, args)?;
+    let pid = child.id().map(|id| id as i32);
+    let stdout = child.stdout.take().expect("stdout was piped at spawn");
+    let stderr = child.stderr.take().expect("stderr was piped at spawn");
+
+    let stdout_task = tokio::spawn(pump_lines(stdout, Arc::clone(state)));
+    let stderr_task = tokio::spawn(pump_lines(stderr, Arc::clone(state)));
+
+    let started = Instant::now();
+    let outcome = tokio::select! {
+        status = child.wait() => Outcome::Exited(exit_code(status.map_err(WrapError::Wait)?)),
+        sig = signals.recv() => Outcome::Signaled(sig),
+        () = deadline_or_pending(deadline) => Outcome::TimedOut,
+    };
+    let elapsed = started.elapsed();
+
+    let stop_pid = pid.filter(|_| !matches!(outcome, Outcome::Exited(_)));
+    if let Some(pid) = stop_pid {
+        stop_process_group(pid, &mut child).await;
+    }
+
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
+
+    Ok((outcome, elapsed))
 }
 
 fn spawn(program: &str, args: &[String]) -> Result<Child, WrapError> {
@@ -312,7 +393,10 @@ impl SharedState {
             return;
         }
         let line = if self.timestamps {
-            format!("{} {line}", humantime::format_rfc3339_millis(SystemTime::now()))
+            format!(
+                "{} {line}",
+                humantime::format_rfc3339_millis(SystemTime::now())
+            )
         } else {
             line
         };
@@ -351,7 +435,116 @@ mod tests {
             timeout: None,
             timestamps: false,
             repeat: false,
+            prime: None,
         }
+    }
+
+    fn counter_path(tag: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "cilogger-prime-test-{tag}-{}.count",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn tick(path: &std::path::Path) -> String {
+        format!("echo x >> {}", path.display())
+    }
+
+    fn ticks(path: &std::path::Path) -> usize {
+        std::fs::read_to_string(path).map_or(0, |s| s.lines().count())
+    }
+
+    #[tokio::test]
+    async fn prime_success_runs_before_the_command() {
+        let order = counter_path("order");
+        let config = WrapConfig {
+            prime: Some(format!("echo prime >> {}", order.display())),
+            ..base_config(vec![
+                "sh".into(),
+                "-c".into(),
+                format!("echo main >> {}", order.display()),
+            ])
+        };
+
+        let outcome = run(config).await.expect("run succeeds");
+
+        assert_eq!(outcome, Outcome::Exited(0));
+        let contents = std::fs::read_to_string(&order).expect("read order file");
+        assert_eq!(contents.lines().collect::<Vec<_>>(), ["prime", "main"]);
+        let _ = std::fs::remove_file(&order);
+    }
+
+    #[tokio::test]
+    async fn prime_failure_skips_the_command_and_propagates_its_code() {
+        let main_ran = counter_path("skip");
+        let config = WrapConfig {
+            prime: Some("exit 5".into()),
+            repeat: true,
+            ..base_config(vec!["sh".into(), "-c".into(), tick(&main_ran)])
+        };
+
+        let outcome = run(config).await.expect("run succeeds");
+
+        assert_eq!(outcome, Outcome::Exited(5));
+        assert_eq!(
+            ticks(&main_ran),
+            0,
+            "command must not run after failed prime"
+        );
+    }
+
+    #[tokio::test]
+    async fn prime_runs_once_even_when_repeating() {
+        let prime_runs = counter_path("once-prime");
+        let main_runs = counter_path("once-main");
+        let script = format!(
+            "{}; [ \"$(wc -l < {})\" -lt 3 ] && exit 0; exit 9",
+            tick(&main_runs),
+            main_runs.display()
+        );
+        let config = WrapConfig {
+            prime: Some(tick(&prime_runs)),
+            repeat: true,
+            ..base_config(vec!["sh".into(), "-c".into(), script])
+        };
+
+        let outcome = run(config).await.expect("run succeeds");
+
+        assert_eq!(outcome, Outcome::Exited(9));
+        assert_eq!(ticks(&prime_runs), 1);
+        assert_eq!(ticks(&main_runs), 3);
+        let _ = std::fs::remove_file(&prime_runs);
+        let _ = std::fs::remove_file(&main_runs);
+    }
+
+    #[tokio::test]
+    async fn timeout_during_prime_skips_the_command_and_is_success() {
+        let main_ran = counter_path("timeout");
+        let config = WrapConfig {
+            prime: Some("sleep 5".into()),
+            timeout: Some(Duration::from_millis(100)),
+            ..base_config(vec!["sh".into(), "-c".into(), tick(&main_ran)])
+        };
+
+        let started = std::time::Instant::now();
+        let outcome = run(config).await.expect("run succeeds");
+
+        assert_eq!(outcome, Outcome::TimedOut);
+        assert_eq!(process_exit_code(outcome), 0);
+        assert_eq!(ticks(&main_ran), 0);
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn empty_prime_is_rejected() {
+        let config = WrapConfig {
+            prime: Some("  ".into()),
+            ..base_config(vec!["true".into()])
+        };
+
+        assert!(matches!(run(config).await, Err(WrapError::EmptyPrime)));
     }
 
     #[tokio::test]
@@ -511,7 +704,10 @@ mod tests {
             .trim()
             .parse()
             .expect("counter is a number");
-        assert!(runs > 1, "expected more than one iteration but got {runs} instead");
+        assert!(
+            runs > 1,
+            "expected more than one iteration but got {runs} instead"
+        );
 
         let _ = std::fs::remove_file(&counter);
     }

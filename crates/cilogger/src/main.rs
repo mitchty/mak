@@ -34,6 +34,13 @@ struct Cli {
     #[arg(short = 'r', long)]
     repeat: bool,
 
+    /// Prime command that must run and succeed prior to the command loop
+    /// `--prime 'nix flake check -L'`. If it fails it exits just like the
+    /// normal command loop and it behaves the same and under the same
+    /// conditions as --timeout and the --command loop.
+    #[arg(short = 'p', long)]
+    prime: Option<String>,
+
     /// Rest is the command to run, and its arguments to exec()
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
     command: Vec<String>,
@@ -50,6 +57,7 @@ async fn main() -> Result<()> {
         timeout: cli.timeout.map(Into::<Duration>::into),
         timestamps: cli.timestamps,
         repeat: cli.repeat,
+        prime: cli.prime,
     };
 
     let outcome = wrap::run(config)
