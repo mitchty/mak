@@ -42,6 +42,7 @@
 
               variants = {
                 default = { };
+                release.cargoProfile = "release";
               };
             };
 
