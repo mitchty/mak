@@ -125,11 +125,11 @@
         "nixpkgs": "nixpkgs_2"
       },
       "locked": {
-        "lastModified": 1794072975,
-        "narHash": "sha256-CFauhdjdo+uKT5QePNFogqV0jmALBQFyc+UeSmLE25A=",
+        "lastModified": 1794153849,
+        "narHash": "sha256-nGge14yyrK6I/w+ecR7cnoRHCUu8fu/oinCeTuSnKis=",
         "owner": "mitchty",
         "repo": "flakelight-rust",
-        "rev": "be201a1f0af13c4334cdd5cef1dd22963361a13c",
+        "rev": "679c6e7c62a975050110d1039be5b0df71d23baa",
         "type": "github"
       },
       "original": {
